@@ -2,4 +2,6 @@ streamlit
 opencv-python-headless
 pytesseract
 pdf2image
+pypdf
+pandas
 numpy
