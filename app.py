@@ -43,9 +43,11 @@ TONARTEN = ["B", "Es", "C", "F", "As", "D", "G"]
 
 
 # --- PARSER-START ---
-def parse_header_text(ocr_text):
+def parse_header_text(ocr_text, segmente=None):
     """Liest Nummer, Instrument, Stimme, Tonart und Titel aus dem OCR-Text der Kopfzeile."""
     lines = [line.strip() for line in ocr_text.split("\n") if line.strip()]
+    if segmente:                                     # zweiter OCR-Durchgang als zusätzliche Textquelle
+        lines = lines + [sg["text"] for sg in segmente]
     full_text = " ".join(lines)
 
     data = {"nummer": None, "instrument": None, "stimme": None,
@@ -73,19 +75,107 @@ def parse_header_text(ocr_text):
     if t:
         data["tonart"] = t.group(1)
 
-    # 5. Titel: Zeilen mit Instrument überspringen, Nummer entfernen, längste Zeile nehmen
-    kandidaten = []
-    for line in lines:
-        if re.search(rf"\b({INSTR_ALT})\b", line, re.IGNORECASE):
-            continue
-        cleaned = re.sub(r"\b(?:Nr|No)\.?\s*\d{1,3}\b", "", line, flags=re.IGNORECASE)
-        cleaned = re.sub(r"[^\w\s-]", "", cleaned).strip()
-        if len(cleaned) > 2:
-            kandidaten.append(cleaned)
-    if kandidaten:
-        data["titel"] = max(kandidaten, key=len)[:60].strip().replace(" ", "_")
+    # 5. Titel (aus den gefilterten Textstücken der Kopfzeile)
+    data["titel"] = finde_titel(lines, segmente)
 
     return data
+
+
+def zeilen_segmente(woerter, min_conf=20):
+    """Gruppiert OCR-Wörter (mit Position) zu Textstücken: gleiche Zeile, ohne große Lücken."""
+    w = [x for x in woerter if x["text"].strip() and x["conf"] >= min_conf]
+    if not w:
+        return []
+    w.sort(key=lambda x: x["top"] + x["h"] / 2)
+    zeilen = []
+    for x in w:
+        cy = x["top"] + x["h"] / 2
+        if zeilen and abs(cy - zeilen[-1]["cy"]) <= 0.6 * max(x["h"], zeilen[-1]["h"]):
+            z = zeilen[-1]
+            z["w"].append(x)
+            n = len(z["w"])
+            z["cy"] = (z["cy"] * (n - 1) + cy) / n
+            z["h"] = max(z["h"], x["h"])
+        else:
+            zeilen.append({"w": [x], "cy": cy, "h": x["h"]})
+
+    teile = []
+    for z in zeilen:
+        ws = sorted(z["w"], key=lambda x: x["left"])
+        aktuell = [ws[0]]
+        for prev, x in zip(ws, ws[1:]):
+            luecke = x["left"] - (prev["left"] + prev["w"])
+            if luecke > 2.0 * max(prev["h"], x["h"]):      # große Lücke = anderes Textstück (z. B. Komponist rechts)
+                teile.append(aktuell)
+                aktuell = []
+            aktuell.append(x)
+        teile.append(aktuell)
+
+    ergebnis = []
+    for seg in teile:
+        hs = sorted(x["h"] for x in seg)
+        ergebnis.append({
+            "text": " ".join(x["text"] for x in seg), "woerter": seg,
+            "conf": sum(x["conf"] for x in seg) / len(seg), "hoehe": hs[len(hs) // 2],
+            "top": min(x["top"] for x in seg), "left": seg[0]["left"],
+        })
+    ergebnis.sort(key=lambda t: (t["top"], t["left"]))
+    return ergebnis
+
+
+def finde_titel(lines, segmente=None):
+    """Sucht den Titel: das größte, sicher gelesene Textstück ohne Instrument. Rauschen wird herausgefiltert."""
+    kandidaten = []
+    if segmente:
+        for sg in segmente:
+            if re.search(rf"\b({INSTR_ALT})\b", sg["text"], re.IGNORECASE):
+                continue
+            gute = []                                   # (Text, Sicherheit, Höhe)
+            for wd in sg["woerter"]:
+                t = re.sub(r"[^\w-]", "", wd["text"]).strip("_")
+                if not t:
+                    continue
+                buchstaben = sum(c.isalpha() for c in t)
+                if buchstaben == 0:
+                    if t.isdigit() and 2 <= len(t) <= 4 and wd["conf"] >= 60:
+                        gute.append((t, wd["conf"], wd["h"]))
+                    continue
+                mindest = 60 if buchstaben < 4 else 45      # kurze Wörter müssen sicherer gelesen sein
+                if wd["conf"] < mindest or buchstaben < 2 or buchstaben / len(t) < 0.75:
+                    continue
+                gute.append((t, wd["conf"], wd["h"]))
+            if not gute:
+                continue
+            hmax = max(h for _, _, h in gute)
+            gute = [g for g in gute if g[2] >= 0.45 * hmax]   # viel kleinere Zeichen = Rauschen
+            text = re.sub(r"\b(?:Nr|No)\s*\d{1,3}\b", "", " ".join(g[0] for g in gute),
+                          flags=re.IGNORECASE).strip()
+            if sum(c.isalpha() for c in text) < 4:
+                continue
+            if not any(sum(c.isalpha() for c in t) >= 3 for t in text.split()):
+                continue
+            hoehen = sorted(g[2] for g in gute)
+            hoehe = hoehen[len(hoehen) // 2]
+            conf = sum(g[1] for g in gute) / len(gute)
+            kandidaten.append((hoehe * conf / 100.0, text))
+        if not kandidaten:
+            return None
+        text = max(kandidaten, key=lambda k: k[0])[1]
+    else:
+        for line in lines:
+            if re.search(rf"\b({INSTR_ALT})\b", line, re.IGNORECASE):
+                continue
+            cleaned = re.sub(r"\b(?:Nr|No)\.?\s*\d{1,3}\b", "", line, flags=re.IGNORECASE)
+            cleaned = re.sub(r"[^\w\s-]", "", cleaned).strip()
+            if len(cleaned) > 2:
+                kandidaten.append((len(cleaned), cleaned))
+        if not kandidaten:
+            return None
+        text = max(kandidaten, key=lambda k: k[0])[1]
+
+    if text.isupper():
+        text = text.title()
+    return text[:60].strip().replace(" ", "_")
 
 
 def parse_footer_text(ocr_text):
@@ -130,14 +220,47 @@ def vorschau_png(bild):
     return png.tobytes() if ok else None
 
 
+def notenlinien_entfernen(bw):
+    """Entfernt lange waagerechte Linien (Notenlinien, Unterstreichungen), damit sie keine Buchstabensuppe erzeugen."""
+    invers = cv2.bitwise_not(bw)
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (max(40, bw.shape[1] // 12), 1))
+    linien = cv2.morphologyEx(invers, cv2.MORPH_OPEN, kern)
+    return cv2.bitwise_not(cv2.subtract(invers, linien))
+
+
+def ocr_woerter(bild):
+    """OCR mit Position und Sicherheit (Konfidenz) pro Wort."""
+    d = pytesseract.image_to_data(bild, lang="deu+eng", config="--oem 3 --psm 11",
+                                  output_type=pytesseract.Output.DICT)
+    woerter = []
+    for i, t in enumerate(d["text"]):
+        t = str(t).strip()
+        if not t:
+            continue
+        try:
+            conf = float(d["conf"][i])
+        except (TypeError, ValueError):
+            continue
+        if conf < 0:
+            continue
+        woerter.append({"text": t, "conf": conf, "left": d["left"][i], "top": d["top"][i],
+                        "w": d["width"][i], "h": d["height"][i]})
+    return woerter
+
+
 def kopf_analysieren(img, kopf_prozent):
-    """OCR der Kopfzeile. Gibt (Daten, OCR-Text, Vorschau-PNG) zurück."""
+    """OCR der Kopfzeile. Gibt (Daten, OCR-Text, Vorschau-PNG, Textstücke) zurück."""
     hoehe = img.shape[0]
     kopf = img[0:int(hoehe * kopf_prozent / 100), :]
     grau = cv2.cvtColor(kopf, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(grau, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    ocr_text = pytesseract.image_to_string(thresh, lang="deu+eng", config="--oem 3 --psm 6")
-    return parse_header_text(ocr_text), ocr_text, vorschau_png(kopf)
+    _, bw = cv2.threshold(grau, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bw = notenlinien_entfernen(bw)
+
+    ocr_text = pytesseract.image_to_string(bw, lang="deu+eng", config="--oem 3 --psm 6")
+    segmente = zeilen_segmente(ocr_woerter(bw))
+    data = parse_header_text(ocr_text, segmente)
+    info = [{"Text": sg["text"], "Sicherheit": round(sg["conf"]), "Höhe": sg["hoehe"]} for sg in segmente]
+    return data, ocr_text, vorschau_png(kopf), info
 
 
 def fuss_analysieren(img, fuss_prozent):
@@ -153,13 +276,13 @@ def fuss_analysieren(img, fuss_prozent):
 
 
 def seite_auswerten(img, kopf_prozent, fuss_prozent):
-    data, kopf_ocr, kopf_png = kopf_analysieren(img, kopf_prozent)
+    data, kopf_ocr, kopf_png, segmente = kopf_analysieren(img, kopf_prozent)
     nr, von, fuss_ocr, fuss_png = fuss_analysieren(img, fuss_prozent)
-    return {"data": data, "ocr": kopf_ocr, "png": kopf_png,
+    return {"data": data, "ocr": kopf_ocr, "png": kopf_png, "segmente": segmente,
             "fnr": nr, "fvon": von, "fuss_ocr": fuss_ocr, "fuss_png": fuss_png}
 
 
-LEERE_SEITE = {"data": None, "ocr": "", "png": None, "fnr": None, "fvon": None,
+LEERE_SEITE = {"data": None, "ocr": "", "png": None, "segmente": [], "fnr": None, "fvon": None,
                "fuss_ocr": "", "fuss_png": None}
 
 
@@ -467,6 +590,20 @@ with tab_pruefen:
                     st.text("Fußzeile:\n" + (seiten[i]["fuss_ocr"] or "(kein Text erkannt)"))
             if len(ohne_instrument) > 40:
                 st.caption(f"... und {len(ohne_instrument) - 40} weitere.")
+
+    with st.expander("🔍 Diagnose: Kopf- und Fußzeile einer Seite ansehen"):
+        idx = st.selectbox("Seite", list(range(len(seiten))), format_func=lambda i: seiten[i]["quelle"])
+        st.caption("Kopfzeile (Ausschnitt):")
+        if seiten[idx]["png"]:
+            st.image(seiten[idx]["png"])
+        st.caption("Fußzeile (Ausschnitt):")
+        if seiten[idx]["fuss_png"]:
+            st.image(seiten[idx]["fuss_png"])
+        st.caption("Gefundene Textstücke der Kopfzeile (Sicherheit 0–100, Höhe in Pixeln). "
+                   "Als Titel wird das größte, sicher gelesene Stück ohne Instrument genommen.")
+        st.dataframe(pd.DataFrame(seiten[idx]["segmente"]), hide_index=True)
+        st.text("Roher Kopfzeilen-Text:\n" + (seiten[idx]["ocr"] or "(kein Text erkannt)"))
+        st.text("Roher Fußzeilen-Text:\n" + (seiten[idx]["fuss_ocr"] or "(kein Text erkannt)"))
 
 with tab_download:
     bekannt = [e for e in eintraege if e["instrument"]]
